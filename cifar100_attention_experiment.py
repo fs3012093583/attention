@@ -48,10 +48,44 @@ class PatchEmbed(nn.Module):
         return self.proj(patches)
 
 
-class FlattenMLPClassifier(nn.Module):
-    def __init__(self, num_patches: int, d_model: int, hidden: int, num_classes: int) -> None:
+class AttentionBlock(nn.Module):
+    def __init__(self, d_model: int, use_activation: bool, use_residual: bool) -> None:
         super().__init__()
-        self.patch_embed = PatchEmbed(patch_size=int(math.sqrt((32 * 32) / num_patches)), d_model=d_model)
+        self.use_activation = use_activation
+        self.use_residual = use_residual
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.o_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        residual = tokens
+        if self.use_activation:
+            tokens = F.gelu(tokens)
+
+        q = self.q_proj(tokens)
+        k = self.k_proj(tokens)
+        v = self.v_proj(tokens)
+        attn = torch.softmax(torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(tokens.size(-1)), dim=-1)
+        mixed = torch.matmul(attn, v)
+        mixed = self.o_proj(mixed)
+
+        if self.use_residual:
+            mixed = mixed + residual
+        return mixed
+
+
+class FlattenMLPClassifier(nn.Module):
+    def __init__(
+        self,
+        patch_size: int,
+        num_patches: int,
+        d_model: int,
+        hidden: int,
+        num_classes: int,
+    ) -> None:
+        super().__init__()
+        self.patch_embed = PatchEmbed(patch_size=patch_size, d_model=d_model)
         self.classifier = nn.Sequential(
             nn.Linear(num_patches * d_model, hidden),
             nn.GELU(),
@@ -69,37 +103,29 @@ class PatchAttentionClassifier(nn.Module):
         patch_size: int,
         d_model: int,
         num_classes: int,
+        num_layers: int,
         use_activation: bool,
         use_residual: bool = False,
     ) -> None:
         super().__init__()
         self.patch_embed = PatchEmbed(patch_size=patch_size, d_model=d_model)
-        self.use_activation = use_activation
-        self.use_residual = use_residual
-
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.o_proj = nn.Linear(d_model, d_model)
+        self.blocks = nn.ModuleList(
+            [
+                AttentionBlock(
+                    d_model=d_model,
+                    use_activation=use_activation,
+                    use_residual=use_residual,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.head = nn.Linear(d_model, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         tokens = self.patch_embed(x)
-        residual = tokens
-        if self.use_activation:
-            tokens = F.gelu(tokens)
-
-        q = self.q_proj(tokens)
-        k = self.k_proj(tokens)
-        v = self.v_proj(tokens)
-        attn = torch.softmax(torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(tokens.size(-1)), dim=-1)
-        mixed = torch.matmul(attn, v)
-        mixed = self.o_proj(mixed)
-
-        if self.use_residual:
-            mixed = mixed + residual
-
-        pooled = mixed.mean(dim=1)
+        for block in self.blocks:
+            tokens = block(tokens)
+        pooled = tokens.mean(dim=1)
         return self.head(pooled)
 
 
@@ -274,6 +300,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--d-model", type=int, default=64)
+    parser.add_argument("--deep-layers", type=int, default=3)
     return parser.parse_args()
 
 
@@ -294,6 +321,7 @@ def main() -> None:
         patch_size=args.patch_size,
         d_model=args.d_model,
         num_classes=num_classes,
+        num_layers=1,
         use_activation=True,
         use_residual=True,
     )
@@ -303,12 +331,14 @@ def main() -> None:
     print(f"Data root: {args.data_root}")
     print(f"Patch size: {args.patch_size}")
     print(f"Patch tokens: {num_patches}")
+    print(f"Deep attention layers: {args.deep_layers}")
     print(f"Matched MLP hidden width: {matched_hidden}")
 
     configs = [
         (
             f"MLP flatten d->{matched_hidden}->100",
             lambda: FlattenMLPClassifier(
+                patch_size=args.patch_size,
                 num_patches=num_patches,
                 d_model=args.d_model,
                 hidden=matched_hidden,
@@ -321,6 +351,7 @@ def main() -> None:
                 patch_size=args.patch_size,
                 d_model=args.d_model,
                 num_classes=num_classes,
+                num_layers=1,
                 use_activation=False,
             ),
         ),
@@ -330,6 +361,7 @@ def main() -> None:
                 patch_size=args.patch_size,
                 d_model=args.d_model,
                 num_classes=num_classes,
+                num_layers=1,
                 use_activation=True,
             ),
         ),
@@ -339,6 +371,18 @@ def main() -> None:
                 patch_size=args.patch_size,
                 d_model=args.d_model,
                 num_classes=num_classes,
+                num_layers=1,
+                use_activation=True,
+                use_residual=True,
+            ),
+        ),
+        (
+            f"Patch->GELU->Attn x{args.deep_layers}->Pool->100 + residual",
+            lambda: PatchAttentionClassifier(
+                patch_size=args.patch_size,
+                d_model=args.d_model,
+                num_classes=num_classes,
+                num_layers=args.deep_layers,
                 use_activation=True,
                 use_residual=True,
             ),
