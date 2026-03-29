@@ -1,2 +1,4 @@
 .vscode/
 dev_log.md
+__pycache__/
+*.pyc
