@@ -121,7 +121,8 @@ class CustomAttentionFFN(nn.Module):
         mixed = self.o_proj(mixed)
         mixed = self.dropout(mixed)
 
-        return mixed.view(batch_size, num_tokens, self.slots, d_model).mean(dim=2)
+        mixed = mixed.view(batch_size, num_tokens, self.slots, d_model)
+        return torch.nn.functional.gelu(mixed[:, :, -1, :])
 
 
 class TransformerBlock(nn.Module):
